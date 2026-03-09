@@ -1,0 +1,109 @@
+name: Deploy to Cloudflare Pages on tag from main
+
+on:
+  push:
+    tags:
+      - "*"
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  APP_BUILDER_PUBLISH_GCP_REGISTRY_HOSTNAME: ${{ secrets.APP_BUILDER_PUBLISH_GCP_REGISTRY_HOSTNAME }}
+  APP_BUILDER_PUBLISH_GCP_REPO_NAME: ${{ secrets.APP_BUILDER_PUBLISH_GCP_REPO_NAME }}
+  APP_BUILDER_PUBLISH_GKE_CLUSTER: ${{ secrets.APP_BUILDER_PUBLISH_GKE_CLUSTER }}
+
+jobs:
+  deploy-frontend:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+          export_default_credentials: true
+
+      - name: Create version.json from tag
+        id: vars
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          if ! [[ "$VERSION" =~ ^[0-9]+$ ]]; then
+            echo "Tag name must be a number (e.g., 123). Got: $VERSION" >&2
+            exit 1
+          fi
+          mkdir -p frontend/public
+          echo "{ \"version\": ${VERSION} }" > frontend/public/version.json
+          echo "Wrote version.json:" && cat frontend/public/version.json
+          IMAGE_NAME=$(basename $GITHUB_REPOSITORY | tr '[:upper:]' '[:lower:]')
+          FULL_IMAGE_NAME="${APP_BUILDER_PUBLISH_GCP_REGISTRY_HOSTNAME}/${GCP_PROJECT_ID}/${APP_BUILDER_PUBLISH_GCP_REPO_NAME}/${IMAGE_NAME}-frontend:${VERSION}"
+          echo "Frontend version: $VERSION"
+          echo "Frontend image to be used: $FULL_IMAGE_NAME"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "image_name=$FULL_IMAGE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Set up GCP credentials
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Authenticate Docker with Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ env.APP_BUILDER_PUBLISH_GCP_REGISTRY_HOSTNAME }} --quiet
+          gcloud auth print-access-token | docker login ${{ env.APP_BUILDER_PUBLISH_GCP_REGISTRY_HOSTNAME }} \
+            -u oauth2accesstoken --password-stdin
+
+      - name: Build Docker image
+        working-directory: frontend
+        run: docker build . -f Dockerfile.publish -t ${{ steps.vars.outputs.image_name }}
+
+      - name: Push Docker image
+        run: docker push ${{ steps.vars.outputs.image_name }}
+
+  deploy-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+          export_default_credentials: true
+
+      - name: Set image name and version
+        id: vars
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          if ! [[ "$VERSION" =~ ^[0-9]+$ ]]; then
+            echo "Tag name must be a number (e.g., 123). Got: $VERSION" >&2
+            exit 1
+          fi
+          IMAGE_NAME=$(basename $GITHUB_REPOSITORY | tr '[:upper:]' '[:lower:]')
+          FULL_IMAGE_NAME="${APP_BUILDER_PUBLISH_GCP_REGISTRY_HOSTNAME}/${GCP_PROJECT_ID}/${APP_BUILDER_PUBLISH_GCP_REPO_NAME}/${IMAGE_NAME}-backend:${VERSION}"
+          echo "Backend version: $VERSION"
+          echo "Image to be used: $FULL_IMAGE_NAME"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "image_name=$FULL_IMAGE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Set up GCP credentials
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Authenticate Docker with Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ env.APP_BUILDER_PUBLISH_GCP_REGISTRY_HOSTNAME }} --quiet
+          gcloud auth print-access-token | docker login ${{ env.APP_BUILDER_PUBLISH_GCP_REGISTRY_HOSTNAME }} \
+            -u oauth2accesstoken --password-stdin
+
+      - name: Build Docker image
+        working-directory: backend
+        run: docker build . -f Dockerfile.publish -t ${{ steps.vars.outputs.image_name }}
+
+      - name: Push Docker image
+        run: docker push ${{ steps.vars.outputs.image_name }}

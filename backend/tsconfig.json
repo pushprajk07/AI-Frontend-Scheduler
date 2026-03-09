@@ -1,0 +1,26 @@
+{
+    "compilerOptions": {
+        "esModuleInterop": true /* Enables emit interoperability between CommonJS and ES Modules via creation of namespace objects for all imports. Implies 'allowSyntheticDefaultImports'. */,
+        "skipLibCheck": true /* Skip type checking of all declaration files (*.d.ts). */,
+        "target": "esnext" /* Specify ECMAScript target version: 'es3', 'es5', 'es2015', 'es2016', 'es2017', 'es2018', 'es2019', 'es2020', 'es2021', 'es2022', or 'ESNext'. */,
+        "module": "NodeNext" /* Specify module code generation: 'None', 'CommonJS', 'AMD', 'System', 'UMD', 'ES2015', 'ES2020', 'ESNext', or 'NodeNext'. */,
+        "moduleResolution": "NodeNext" /* Specify module resolution strategy: 'Node' (Node.js) or 'Classic' (TypeScript pre-1.6). */,
+        "resolveJsonModule": true /* Include modules imported with .json extension. */,
+        "moduleDetection": "force" /* Specify how TypeScript looks up a file from a given module specifier. 'force' ensures that every non-declaration file is treated as a module. */,
+        "isolatedModules": true /* Ensure that each file can be safely transpiled without relying on other imports.*/,
+        "strict": true /* Enable all strict type-checking options. */,
+        // "noUncheckedIndexedAccess": true /* Add 'undefined' to the type of indexed access operations. */,
+        "noUnusedLocals": true /* Report errors on unused locals. */,
+        "lib": [
+            "ESNext",
+            "DOM"
+        ] /* Specify library files to be included in the compilation. This can include 'es2022', 'dom', etc. */,
+        "outDir": "dist" /* Redirect output structure to the directory. */,
+        "rootDir": "src" /* Specify the root directory of input files. Use to control the output directory structure with --outDir. */,
+        "noEmit": false /* Do not emit outputs. */,
+        "baseUrl": "./src" /* Base directory to resolve non-absolute module names. */,
+        "allowImportingTsExtensions": true /* Allow importing files with .ts extensions. This is useful for TypeScript projects that want to import other TypeScript files directly. */,
+        "rewriteRelativeImportExtensions": true /* Rewrite relative import paths to include file extensions. This is useful for projects that want to ensure all imports are explicit about their file types. */
+    },
+    "exclude": ["prisma.config.ts"]
+}

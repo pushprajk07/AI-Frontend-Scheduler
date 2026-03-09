@@ -1,0 +1,8 @@
+build
+dist
+src/generated
+*handlebars
+node_modules
+*md
+*test.ts
+pnpm-lock.yaml

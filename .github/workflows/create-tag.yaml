@@ -1,0 +1,59 @@
+name: Create Tag on Push to Main
+
+on:
+  push:
+    branches:
+      - template/*
+    # Skip if the push is a tag (to avoid infinite loops)
+    tags-ignore:
+      - "*"
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  APP_BUILDER_PREVIEW_GCP_REGISTRY_HOSTNAME: ${{ secrets.APP_BUILDER_PREVIEW_GCP_REGISTRY_HOSTNAME }}
+  APP_BUILDER_PREVIEW_GCP_REPO_NAME: ${{ secrets.APP_BUILDER_PREVIEW_GCP_REPO_NAME }}
+
+jobs:
+  create-tag:
+    runs-on: ubuntu-latest
+    # Grant permissions to write contents (needed for pushing tags)
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history for tags
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.sha }} # Explicitly checkout the commit that triggered the workflow
+
+      - name: Get tag from repository variables and build tag name
+        id: tag
+        run: |
+          # Get tag from repository variables
+          TAG_NAME="${{ vars.TAG_NAME }}"
+
+          # Extract branch name part after template/ (e.g., "default" from "template/default")
+          BRANCH_NAME="${{ github.ref_name }}"
+          BRANCH_PART="${BRANCH_NAME#template/}"
+
+
+          # Combine branch part with tag: branch-part-TAG_NAME
+          FINAL_TAG_NAME="${BRANCH_PART}-${TAG_NAME}"
+
+          echo "tag_name=${FINAL_TAG_NAME}" >> $GITHUB_OUTPUT
+
+          echo "Branch: ${BRANCH_NAME}"
+          echo "Branch part: ${BRANCH_PART}"
+          echo "Tag from variable: ${TAG_NAME}"
+          echo "Final tag name: ${FINAL_TAG_NAME}"
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Create tag on the specific commit that triggered the workflow
+          git tag -a "${{ steps.tag.outputs.tag_name }}" "${{ github.sha }}" -m "Auto-generated tag from push to ${{ github.ref_name }} [skip ci]" -f
+          git push origin "${{ steps.tag.outputs.tag_name }}" --force
+          echo "Created and pushed tag: ${{ steps.tag.outputs.tag_name }} on commit ${{ github.sha }}"

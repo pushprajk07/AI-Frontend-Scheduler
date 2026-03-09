@@ -1,0 +1,167 @@
+// This is your Prisma schema file,
+generator client {
+  provider      = "prisma-client-js"
+  output        = "../generated/prisma"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Auth models
+model User {
+  id         String         @id @default(uuid())
+  email      String         @unique
+  name       String?
+  createdAt  DateTime       @default(now())
+  identities UserIdentity[]
+  isDeleted  Boolean?
+
+  @@index([email])
+}
+
+model UserIdentity {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider   String // 'Google', 'GitHub', 'EmailPassword', 'PhoneOTP', etc.
+  providerId String // Provider's unique user ID (or email for email/password)
+  metadata   Json? // Provider-specific data (passwordHash, tokens, profile data, etc.)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  isDeleted  Boolean?
+
+  @@unique([provider, providerId])
+  @@index([userId])
+}
+
+
+model Otp {
+
+
+  id         String   @id @default(uuid())
+
+
+  identifier String   // Phone number or email address
+
+
+  type       String   // 'phone' or 'email'
+
+
+  otp        String   // Hashed OTP
+
+
+  expiresAt  DateTime
+
+
+  attempts   Int      @default(0)
+
+
+  verified   Boolean  @default(false)
+
+
+  purpose    String?  // 'login', 'registration', 'password_reset', '2fa', etc.
+
+
+  createdAt  DateTime @default(now())
+
+
+  updatedAt  DateTime @updatedAt
+
+
+  isDeleted  Boolean?
+
+
+
+
+
+  @@index([identifier, type])
+
+
+  @@index([expiresAt])
+
+
+  @@index([identifier, type, verified])
+
+
+}
+
+
+
+
+
+model Appointment {
+
+
+  id                  Int      @id @default(autoincrement())
+
+
+  name                String
+
+
+  email               String
+
+
+  phone               String
+
+
+  meetingType         String
+
+
+  date                String
+
+
+  time                String
+
+
+  timezone            String?
+
+
+  status              String   @default("Scheduled")
+
+
+  tone                String?
+
+
+  confirmationEmail   String?  @db.Text
+
+
+  rescheduleMessage   String?  @db.Text
+
+
+  cancellationMessage String?  @db.Text
+
+
+  reminderMessage     String?  @db.Text
+
+
+  meetingAgenda       String?  @db.Text
+
+
+  duration            String?
+
+
+  meetingLink         String?
+
+
+  meetingId           String?
+  location            String?
+  createdAt           DateTime @default(now())
+
+
+  updatedAt           DateTime @updatedAt
+
+
+  isDeleted           Boolean  @default(false)
+
+
+
+
+
+  @@index([email])
+
+
+}
+

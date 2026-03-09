@@ -1,0 +1,144 @@
+stages:
+  - deploy
+
+variables:
+  NODE_VERSION: "20"
+  PNPM_VERSION: "8"
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+    - when: never
+
+deploy-frontend:
+  stage: deploy
+  image: google/cloud-sdk:latest
+
+  services:
+    - docker:dind
+
+  # Only run on tags
+  rules:
+    - if: $CI_COMMIT_TAG
+    - when: never
+
+  before_script:
+    # Install Docker CLI from official Docker repository
+    - |
+      apt-get update
+      apt-get install -y ca-certificates curl gnupg
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      chmod a+r /etc/apt/keyrings/docker.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+      apt-get update
+      apt-get install -y docker-ce-cli
+
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "/certs/client"
+
+  script:
+    # Set image name and version
+    - |
+      VERSION="${CI_COMMIT_TAG}"
+      if ! [[ "$VERSION" =~ ^[0-9]+$ ]]; then
+        echo "Tag name must be a number (e.g., 123). Got: $VERSION" >&2
+        exit 1
+      fi
+      mkdir -p frontend/public
+      echo "{ \"version\": ${VERSION} }" > frontend/public/version.json
+      echo "Wrote version.json:" && cat frontend/public/version.json
+      IMAGE_NAME=$(echo ${CI_PROJECT_NAME} | tr '[:upper:]' '[:lower:]')
+      FULL_IMAGE_NAME="${APP_BUILDER_PUBLISH_GCP_REGISTRY_HOSTNAME}/${GCP_PROJECT_ID}/${APP_BUILDER_PUBLISH_GCP_REPO_NAME}/${IMAGE_NAME}-frontend:${VERSION}"
+      echo "Frontend version: $VERSION"
+      echo "Image to be used: $FULL_IMAGE_NAME"
+      export VERSION
+      export IMAGE_NAME
+      export FULL_IMAGE_NAME
+
+    # Authenticate with GCP
+    - |
+      echo -n "$GCP_SA_KEY" | base64 --decode > ${HOME}/gcp-key.json
+      gcloud auth activate-service-account --key-file=${HOME}/gcp-key.json
+      gcloud config set project $GCP_PROJECT_ID
+
+    # Authenticate Docker with Artifact Registry
+    - |
+      gcloud auth configure-docker $APP_BUILDER_PUBLISH_GCP_REGISTRY_HOSTNAME --quiet
+      gcloud auth print-access-token | docker login $APP_BUILDER_PUBLISH_GCP_REGISTRY_HOSTNAME \
+        -u oauth2accesstoken --password-stdin
+
+    # Build Docker image
+    - cd frontend
+    - docker build . -f Dockerfile.publish -t $FULL_IMAGE_NAME
+
+    # Push Docker image
+    - docker push $FULL_IMAGE_NAME
+
+deploy-backend:
+  stage: deploy
+  image: google/cloud-sdk:latest
+
+  services:
+    - docker:dind
+
+  # Only run on tags
+  rules:
+    - if: $CI_COMMIT_TAG
+    - when: never
+
+  before_script:
+    # Install Docker CLI from official Docker repository
+    - |
+      apt-get update
+      apt-get install -y ca-certificates curl gnupg
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      chmod a+r /etc/apt/keyrings/docker.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+      apt-get update
+      apt-get install -y docker-ce-cli
+
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "/certs/client"
+
+  script:
+    # Set image name and version
+    - |
+      VERSION="${CI_COMMIT_TAG}"
+      if ! [[ "$VERSION" =~ ^[0-9]+$ ]]; then
+        echo "Tag name must be a number (e.g., 123). Got: $VERSION" >&2
+        exit 1
+      fi
+      IMAGE_NAME=$(echo ${CI_PROJECT_NAME} | tr '[:upper:]' '[:lower:]')
+      FULL_IMAGE_NAME="${APP_BUILDER_PUBLISH_GCP_REGISTRY_HOSTNAME}/${GCP_PROJECT_ID}/${APP_BUILDER_PUBLISH_GCP_REPO_NAME}/${IMAGE_NAME}-backend:${VERSION}"
+      echo "Backend version: $VERSION"
+      echo "Image to be used: $FULL_IMAGE_NAME"
+      export VERSION
+      export IMAGE_NAME
+      export FULL_IMAGE_NAME
+
+    # Authenticate with GCP
+    - |
+      echo -n "$GCP_SA_KEY" | base64 --decode > ${HOME}/gcp-key.json
+      gcloud auth activate-service-account --key-file=${HOME}/gcp-key.json
+      gcloud config set project $GCP_PROJECT_ID
+
+    # Authenticate Docker with Artifact Registry
+    - |
+      gcloud auth configure-docker $APP_BUILDER_PUBLISH_GCP_REGISTRY_HOSTNAME --quiet
+      gcloud auth print-access-token | docker login $APP_BUILDER_PUBLISH_GCP_REGISTRY_HOSTNAME \
+        -u oauth2accesstoken --password-stdin
+
+    # Build Docker image
+    - cd backend
+    - docker build . -f Dockerfile.publish -t $FULL_IMAGE_NAME
+
+    # Push Docker image
+    - docker push $FULL_IMAGE_NAME
