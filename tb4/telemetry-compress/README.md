@@ -42,3 +42,7 @@ Clearing 33 requires every structural insight, proper entropy coding, *and* seve
 - Reference (`solution/`, pure Python, context-modelled binary arithmetic coder plus priors learned from `/app/data` at install time) passes all 6 tests in Docker. It reaches 34.8–35.0 on scoring logs, about 3 s per call.
 - The no-op solution fails all 6.
 - An xz-only solution and a structural columns + xz solution both fail the ratio tests.
+
+## Rollout result (internal, not Harbor)
+
+One Opus trial ran in a sandboxed, network-less container built from the task image, with no access to `tests/` or `solution/`, and was graded with the real `tests/test.sh`. It **passed all 6 tests** with a ratio of about **41.7**. That beats the reference (34.9) as well as the threshold (33). The agent found every planted regularity and also modelled request arrivals as a rate-tracked Poisson process. At the current threshold the task therefore does **not** meet the "at most 3/9" gate.
