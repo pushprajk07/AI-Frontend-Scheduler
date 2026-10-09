@@ -197,6 +197,10 @@ static int parse_name(const char *name, uint64_t *num) {
         *num = strtoull(name, NULL, 10);
         return 1;
     }
+    if (n > 5 && !strcmp(name + n - 5, ".blob") && all_digits(name, n - 5)) {
+        *num = strtoull(name, NULL, 10);
+        return 1;
+    }
     return 0;
 }
 static char *fname(const char *fmt, uint64_t n) { char *s = xmalloc(64); snprintf(s, 64, fmt, (unsigned long long)n); return s; }
@@ -314,7 +318,7 @@ static int lz_decompress(const uint8_t *b, size_t n, buf_t *out) {
 
 /* ------------------------------------------------------------ entries */
 
-enum { T_DEL = 0, T_VAL = 1, T_RDEL = 0x0F };
+enum { T_DEL = 0, T_VAL = 1, T_BLOB = 2, T_MERGE = 3, T_RDEL = 0x0F };
 
 typedef struct { buf_t k; uint64_t seq; int t; buf_t v; } entry_t;      /* point entry */
 typedef struct { buf_t b, e; uint64_t seq; } rdel_t;
@@ -535,45 +539,59 @@ static void read_table(const char *name, entries_t *pts, rdels_t *rds) {
 
 typedef struct { uint64_t number, size; buf_t smallest, largest; } filemeta_t;
 typedef struct { filemeta_t *v; size_t n, cap; } files_t;
-typedef struct { buf_t xid; ops_t ops; uint64_t log_no; } prep_t;
+typedef struct { buf_t xid; ops_t ops; uint64_t log_no; } prep_t;   /* ops are wire ops */
+
+#define MAX_STRIPES 16
 
 static struct {
     size_t write_buffer_size, l0_trigger, recycle_num, max_manifest, target_file_size, purge_every;
     int compression;
+    size_t stripes, rotate_every, blob_threshold, blob_file_size;
     const char *recover_cmd;
-} opt = {8 * 1024, 3, 2, 16 * 1024, 16 * 1024, 4, 1, "/app/kvrecover"};
+} opt = {8 * 1024, 3, 2, 16 * 1024, 16 * 1024, 4, 1, 2, 2, 1024, 64 * 1024, "/app/kvrecover"};
 
 static struct {
     uint64_t next_file, log_number, min_keep, last_seq;
     files_t levels[2];
     entries_t mem; rdels_t mem_rd;
     size_t log_bytes;
-    uint64_t log_no; int log_fd; logw_t logw; int have_log;
+    uint64_t log_nos[MAX_STRIPES]; int log_fds[MAX_STRIPES]; logw_t logws[MAX_STRIPES];
+    uint64_t next_lsn, flushed_lsn;
+    int blob_fd; uint64_t blob_no; size_t blob_size;
+    uint64_t *blob_files; size_t nblob;
     char **recycle; int nrecycle;
     prep_t *prep; int nprep;
-    uint64_t flush_count;
+    uint64_t flush_count, rotate_count;
     uint64_t manifest_no; int have_manifest; int manifest_fd; logw_t manw;
 } db;
 
 static uint64_t new_file_number(void) { return db.next_file++; }
+static uint64_t max_log_no(void) { uint64_t m = 0; for (size_t i = 0; i < opt.stripes; i++) if (db.log_nos[i] > m) m = db.log_nos[i]; return m; }
 
-static void new_log(void) {
-    uint64_t n = new_file_number();
-    char *name = LOG_NAME(n);
-    int fd;
-    if (db.nrecycle) {
-        char *old = db.recycle[0];
-        memmove(db.recycle, db.recycle + 1, sizeof(char *) * (db.nrecycle - 1));
-        db.nrecycle--;
-        fd = f_reuse(old, name);
-        free(old);
-    } else {
-        fd = f_create(name);
+static void new_log_set(void) {
+    for (size_t s = 0; s < opt.stripes; s++) {
+        uint64_t n = new_file_number();
+        char *name = LOG_NAME(n);
+        int fd;
+        if (db.nrecycle) {
+            char *old = db.recycle[0];
+            memmove(db.recycle, db.recycle + 1, sizeof(char *) * (db.nrecycle - 1));
+            db.nrecycle--;
+            fd = f_reuse(old, name);
+            free(old);
+        } else {
+            fd = f_create(name);
+        }
+        free(name);
+        db.log_nos[s] = n; db.log_fds[s] = fd;
+        logw_init(&db.logws[s], fd, 1, (uint32_t)n);
     }
-    free(name);
-    db.log_no = n; db.log_fd = fd; db.have_log = 1;
-    logw_init(&db.logw, fd, 1, (uint32_t)n);
     db.log_bytes = 0;
+}
+
+static void sync_wal(void) {
+    if (db.blob_fd >= 0) f_sync(db.blob_fd);
+    for (size_t s = 0; s < opt.stripes; s++) f_sync(db.log_fds[s]);
 }
 
 static void table_finish(tableb_t *t, uint64_t number, files_t *out) {
@@ -613,8 +631,8 @@ static files_t write_tables(entries_t *ents, rdels_t *rds, int split) {
 
 /* version edits */
 typedef struct {
-    int has_comparator, has_log_number, has_min_keep;
-    uint64_t log_number, min_keep;
+    int has_comparator, has_log_number, has_min_keep, has_flushed;
+    uint64_t log_number, min_keep, flushed_lsn;
     uint64_t (*deleted)[2]; size_t ndel;
     struct { int level; filemeta_t f; } *added; size_t nadd;
 } edit_t;
@@ -635,6 +653,7 @@ static buf_t edit_encode(edit_t *e) {
     b_varint(&o, 3); b_varint(&o, db.next_file);
     b_varint(&o, 4); b_varint(&o, db.last_seq);
     if (e->has_min_keep) { b_varint(&o, 7); b_varint(&o, e->min_keep); }
+    if (e->has_flushed) { b_varint(&o, 8); b_varint(&o, e->flushed_lsn); }
     for (size_t i = 0; i < e->ndel; i++) { b_varint(&o, 5); b_varint(&o, e->deleted[i][0]); b_varint(&o, e->deleted[i][1]); }
     for (size_t i = 0; i < e->nadd; i++) {
         filemeta_t *f = &e->added[i].f;
@@ -660,6 +679,7 @@ static void write_new_manifest(uint64_t number) {
     edit_t e = {0};
     e.has_comparator = 1; e.has_log_number = 1; e.log_number = db.log_number;
     e.has_min_keep = 1; e.min_keep = db.min_keep;
+    e.has_flushed = 1; e.flushed_lsn = db.flushed_lsn;
     for (int l = 0; l < 2; l++) for (size_t i = 0; i < db.levels[l].n; i++) edit_add(&e, l, db.levels[l].v[i]);
     buf_t enc = edit_encode(&e);
     logw_add(&w, enc.p, enc.n); b_free(&enc);
@@ -684,14 +704,18 @@ static void log_and_apply(edit_t *e) {
     for (size_t i = 0; i < e->nadd; i++) VEC_PUSH(&db.levels[e->added[i].level], e->added[i].f);
     if (e->has_log_number) db.log_number = e->log_number;
     if (e->has_min_keep) db.min_keep = e->min_keep;
+    if (e->has_flushed) db.flushed_lsn = e->flushed_lsn;
     if (db.manw.offset > opt.max_manifest) write_new_manifest(new_file_number());
 }
 
 /* needed WAL numbers */
 static int log_needed(uint64_t n) {
-    if (n >= db.log_number && n <= db.log_no) return 1;
+    if (n >= db.log_number && n <= max_log_no()) return 1;
     for (int i = 0; i < db.nprep; i++) if (db.prep[i].log_no == n) return 1;
     return 0;
+}
+static int canon_is(const char *name, const char *fmt, uint64_t num) {
+    char *c = fname(fmt, num); int r = !strcmp(c, name); free(c); return r;
 }
 static int is_live(const char *name) {
     uint64_t num;
@@ -700,14 +724,12 @@ static int is_live(const char *name) {
     if (r) return 1;
     for (int i = 0; i < db.nrecycle; i++) if (!strcmp(name, db.recycle[i])) return 1;
     size_t n = strlen(name);
-    if (n > 4 && !strcmp(name + n - 4, ".log") && parse_name(name, &num)) {
-        char *canon = LOG_NAME(num); int same = !strcmp(canon, name); free(canon);
-        if (same && log_needed(num)) return 1;
-    }
-    if (n > 4 && !strcmp(name + n - 4, ".sst") && parse_name(name, &num)) {
-        char *canon = SST_NAME(num); int same = !strcmp(canon, name); free(canon);
-        if (same) for (int l = 0; l < 2; l++) for (size_t i = 0; i < db.levels[l].n; i++) if (db.levels[l].v[i].number == num) return 1;
-    }
+    if (!parse_name(name, &num)) return 0;
+    if (n > 4 && !strcmp(name + n - 4, ".log") && canon_is(name, "%06llu.log", num) && log_needed(num)) return 1;
+    if (n > 5 && !strcmp(name + n - 5, ".blob") && canon_is(name, "%06llu.blob", num))
+        for (size_t i = 0; i < db.nblob; i++) if (db.blob_files[i] == num) return 1;
+    if (n > 4 && !strcmp(name + n - 4, ".sst") && canon_is(name, "%06llu.sst", num))
+        for (int l = 0; l < 2; l++) for (size_t i = 0; i < db.levels[l].n; i++) if (db.levels[l].v[i].number == num) return 1;
     return 0;
 }
 static void purge_obsolete(void) {
@@ -719,41 +741,92 @@ static void purge_obsolete(void) {
     names_free(&ns);
 }
 
+/* blobs */
+static void put_fixed32_le(buf_t *b, uint32_t v) { b_fixed32(b, v); }
+static buf_t write_blob(const buf_t *v) {
+    if (db.blob_fd < 0 || db.blob_size >= opt.blob_file_size) {
+        if (db.blob_fd >= 0) { f_sync(db.blob_fd); close(db.blob_fd); }
+        db.blob_no = new_file_number();
+        char *nm = fname("%06llu.blob", db.blob_no);
+        db.blob_fd = f_create(nm); free(nm);
+        db.blob_files = xrealloc(db.blob_files, 8 * (db.nblob + 1));
+        db.blob_files[db.nblob++] = db.blob_no;
+        db.blob_size = 0;
+    }
+    uint64_t off = db.blob_size;
+    f_write(db.blob_fd, v->p, v->n);
+    db.blob_size += v->n;
+    buf_t ptr = {0};
+    b_varint(&ptr, db.blob_no); b_varint(&ptr, off); b_varint(&ptr, v->n);
+    put_fixed32_le(&ptr, crc_mask(crc_extend(0, v->p, v->n)));
+    return ptr;
+}
+static buf_t blob_value(const buf_t *ptr) {
+    size_t p = 0; uint64_t fno, off, ln;
+    if (get_varint(ptr->p, ptr->n, &p, &fno) || get_varint(ptr->p, ptr->n, &p, &off) || get_varint(ptr->p, ptr->n, &p, &ln)) die("bad blob pointer");
+    char *nm = fname("%06llu.blob", fno);
+    buf_t d = f_read(nm); free(nm);
+    buf_t r = {0};
+    if (off < d.n) b_put(&r, d.p + off, (off + ln <= d.n ? ln : d.n - off));
+    b_free(&d);
+    return r;
+}
+/* user ops -> wire ops (large values moved to the blob file) */
+static ops_t to_wire(ops_t *ops) {
+    ops_t w = {0};
+    for (size_t i = 0; i < ops->n; i++) {
+        op_t o = {ops->v[i].t, b_copy(ops->v[i].k.p, ops->v[i].k.n), {0}};
+        if (o.t == T_VAL && ops->v[i].v.n >= opt.blob_threshold) { o.t = T_BLOB; o.v = write_blob(&ops->v[i].v); }
+        else o.v = b_copy(ops->v[i].v.p, ops->v[i].v.n);
+        VEC_PUSH(&w, o);
+    }
+    return w;
+}
+
 static void compact(void);
 
 static void flush(void) {
-    f_sync(db.log_fd); close(db.log_fd);
-    /* logs needed before the switch */
+    sync_wal();
+    db.rotate_count++;
+    int rotate = db.rotate_count >= opt.rotate_every;
     uint64_t *was = NULL; size_t nwas = 0;
-    for (uint64_t n = db.log_number; n <= db.log_no; n++) { was = xrealloc(was, 8 * (nwas + 1)); was[nwas++] = n; }
+    for (uint64_t n = db.log_number; n <= max_log_no(); n++) { was = xrealloc(was, 8 * (nwas + 1)); was[nwas++] = n; }
     for (int i = 0; i < db.nprep; i++) { was = xrealloc(was, 8 * (nwas + 1)); was[nwas++] = db.prep[i].log_no; }
-    new_log();
+    if (rotate) {
+        db.rotate_count = 0;
+        for (size_t s = 0; s < opt.stripes; s++) close(db.log_fds[s]);
+        new_log_set();
+    }
+    db.log_bytes = 0;
     qsort(db.mem.v, db.mem.n, sizeof(entry_t), entry_cmp);
     files_t metas = write_tables(&db.mem, &db.mem_rd, 0);
     edit_t e = {0};
-    e.has_log_number = 1; e.log_number = db.log_no;
-    uint64_t mk = db.log_no;
+    e.has_flushed = 1; e.flushed_lsn = db.next_lsn - 1;
+    if (rotate) { e.has_log_number = 1; e.log_number = db.log_nos[0]; }
+    uint64_t mk = rotate ? e.log_number : db.log_number;
     for (int i = 0; i < db.nprep; i++) if (db.prep[i].log_no < mk) mk = db.prep[i].log_no;
     e.has_min_keep = 1; e.min_keep = mk;
     for (size_t i = 0; i < metas.n; i++) edit_add(&e, 0, metas.v[i]);
     log_and_apply(&e);
     free(e.added); free(metas.v);
-    /* sorted(was_needed - needed_now) */
-    uint64_t *cand = NULL; size_t nc = 0;
-    for (size_t i = 0; i < nwas; i++) {
-        uint64_t n = was[i]; int dup = 0;
-        for (size_t j = 0; j < nc; j++) if (cand[j] == n) dup = 1;
-        if (!dup && !log_needed(n)) { cand = xrealloc(cand, 8 * (nc + 1)); cand[nc++] = n; }
+    if (rotate) {
+        uint64_t *cand = NULL; size_t nc = 0;
+        for (size_t i = 0; i < nwas; i++) {
+            uint64_t n = was[i]; int dup = 0;
+            for (size_t j = 0; j < nc; j++) if (cand[j] == n) dup = 1;
+            if (!dup && !log_needed(n)) { cand = xrealloc(cand, 8 * (nc + 1)); cand[nc++] = n; }
+        }
+        for (size_t i = 0; i < nc; i++) for (size_t j = i + 1; j < nc; j++) if (cand[j] < cand[i]) { uint64_t t = cand[i]; cand[i] = cand[j]; cand[j] = t; }
+        for (size_t i = 0; i < nc; i++) {
+            char *nm = LOG_NAME(cand[i]);
+            if (f_exists(nm) && (size_t)db.nrecycle < opt.recycle_num) {
+                db.recycle = xrealloc(db.recycle, sizeof(char *) * (db.nrecycle + 1));
+                db.recycle[db.nrecycle++] = nm;
+            } else free(nm);
+        }
+        free(cand);
     }
-    for (size_t i = 0; i < nc; i++) for (size_t j = i + 1; j < nc; j++) if (cand[j] < cand[i]) { uint64_t t = cand[i]; cand[i] = cand[j]; cand[j] = t; }
-    for (size_t i = 0; i < nc; i++) {
-        char *nm = LOG_NAME(cand[i]);
-        if (f_exists(nm) && (size_t)db.nrecycle < opt.recycle_num) {
-            db.recycle = xrealloc(db.recycle, sizeof(char *) * (db.nrecycle + 1));
-            db.recycle[db.nrecycle++] = nm;
-        } else free(nm);
-    }
-    free(was); free(cand);
+    free(was);
     for (size_t i = 0; i < db.mem.n; i++) { b_free(&db.mem.v[i].k); b_free(&db.mem.v[i].v); }
     db.mem.n = 0;
     for (size_t i = 0; i < db.mem_rd.n; i++) { b_free(&db.mem_rd.v[i].b); b_free(&db.mem_rd.v[i].e); }
@@ -763,11 +836,18 @@ static void flush(void) {
     if (db.flush_count % opt.purge_every == 0) purge_obsolete();
 }
 
-static int newest_cmp(const void *x, const void *y) {
+static void merge_apply(buf_t *cur, int have, const buf_t *delta) {
+    uint64_t base = (have && cur->n == 8) ? rd64(cur->p) : 0;
+    uint64_t d = delta->n == 8 ? rd64(delta->p) : 0;
+    uint64_t r = base + d;
+    cur->n = 0; b_fixed64(cur, r);
+}
+
+static int key_seq_cmp(const void *x, const void *y) {
     const entry_t *a = x, *b = y;
     int c = bytes_cmp(a->k.p, a->k.n, b->k.p, b->k.n);
     if (c) return c;
-    return a->seq > b->seq ? -1 : a->seq < b->seq ? 1 : 0;
+    return a->seq < b->seq ? -1 : a->seq > b->seq ? 1 : 0;
 }
 
 static void compact(void) {
@@ -779,38 +859,65 @@ static void compact(void) {
             read_table(nm, &pts, &rds); free(nm);
             edit_del(&e, l, db.levels[l].v[i].number);
         }
-    qsort(pts.v, pts.n, sizeof(entry_t), newest_cmp);
+    /* each key's history in ascending sequence order */
+    qsort(pts.v, pts.n, sizeof(entry_t), key_seq_cmp);
     entries_t out = {0};
-    for (size_t i = 0; i < pts.n; i++) {
-        if (i > 0 && !bytes_cmp(pts.v[i].k.p, pts.v[i].k.n, pts.v[i - 1].k.p, pts.v[i - 1].k.n)) continue;
-        entry_t *x = &pts.v[i];
-        if (x->t != T_VAL) continue;
-        int covered = 0;
-        for (size_t j = 0; j < rds.n && !covered; j++)
-            if (bytes_cmp(rds.v[j].b.p, rds.v[j].b.n, x->k.p, x->k.n) <= 0 && bytes_cmp(x->k.p, x->k.n, rds.v[j].e.p, rds.v[j].e.n) < 0 && rds.v[j].seq > x->seq) covered = 1;
-        if (covered) continue;
-        entry_t o = {x->k, 0, T_VAL, x->v};
-        VEC_PUSH(&out, o);
+    size_t i = 0;
+    while (i < pts.n) {
+        size_t j = i;
+        while (j < pts.n && !bytes_cmp(pts.v[j].k.p, pts.v[j].k.n, pts.v[i].k.p, pts.v[i].k.n)) j++;
+        const buf_t *k = &pts.v[i].k;
+        /* range deletions covering this key, ascending by seq */
+        uint64_t *rs = NULL; size_t nrs = 0;
+        for (size_t r = 0; r < rds.n; r++)
+            if (bytes_cmp(rds.v[r].b.p, rds.v[r].b.n, k->p, k->n) <= 0 && bytes_cmp(k->p, k->n, rds.v[r].e.p, rds.v[r].e.n) < 0) {
+                rs = xrealloc(rs, 8 * (nrs + 1)); rs[nrs++] = rds.v[r].seq;
+            }
+        for (size_t a = 0; a < nrs; a++) for (size_t b = a + 1; b < nrs; b++) if (rs[b] < rs[a]) { uint64_t t = rs[a]; rs[a] = rs[b]; rs[b] = t; }
+        int have = 0, ctype = 0; buf_t cur = {0};
+        size_t pi = i, ri = 0;
+        while (pi < j || ri < nrs) {
+            if (ri < nrs && (pi >= j || rs[ri] < pts.v[pi].seq)) { have = 0; ri++; continue; }
+            entry_t *x = &pts.v[pi++];
+            if (x->t == T_DEL) have = 0;
+            else if (x->t == T_MERGE) {
+                buf_t base = {0};
+                if (have) { if (ctype == T_VAL) b_put(&base, cur.p, cur.n); else base = blob_value(&cur); }
+                merge_apply(&base, have, &x->v);
+                cur.n = 0; b_put(&cur, base.p, base.n); b_free(&base);
+                ctype = T_VAL; have = 1;
+            } else { cur.n = 0; b_put(&cur, x->v.p, x->v.n); ctype = x->t; have = 1; }
+        }
+        free(rs);
+        if (have) { entry_t o = {b_copy(k->p, k->n), 0, ctype, cur}; VEC_PUSH(&out, o); }
+        else b_free(&cur);
+        i = j;
     }
     rdels_t none = {0};
     files_t metas = write_tables(&out, &none, 1);
-    for (size_t i = 0; i < metas.n; i++) edit_add(&e, 1, metas.v[i]);
+    for (size_t m = 0; m < metas.n; m++) edit_add(&e, 1, metas.v[m]);
     log_and_apply(&e);
     free(e.added); free(e.deleted); free(metas.v); free(out.v);
 }
 
 /* ---- write path */
-static void append(const buf_t *payload, int sync) {
-    logw_add(&db.logw, payload->p, payload->n);
-    if (sync) f_sync(db.log_fd);
+static void put_header(buf_t *p, uint64_t lsn, uint64_t seq, uint32_t count) { b_fixed64(p, lsn); b_fixed64(p, seq); b_fixed32(p, count); }
+/* appends the record built by `body` (after the 20-byte header); returns the stripe */
+static size_t append(buf_t *payload, int sync) {
+    uint64_t lsn = rd64(payload->p);
+    size_t s = (size_t)(lsn % opt.stripes);
+    logw_add(&db.logws[s], payload->p, payload->n);
+    if (sync) sync_wal();
     db.log_bytes += payload->n;
+    return s;
 }
 static void maybe_flush(void) { if (db.log_bytes >= opt.write_buffer_size) flush(); }
 static void encode_ops(buf_t *o, ops_t *ops) {
     for (size_t i = 0; i < ops->n; i++) {
         b_byte(o, (uint8_t)ops->v[i].t);
         b_lp(o, ops->v[i].k.p, ops->v[i].k.n);
-        if (ops->v[i].t != T_DEL) b_lp(o, ops->v[i].v.p, ops->v[i].v.n);
+        if (ops->v[i].t == T_BLOB) b_put(o, ops->v[i].v.p, ops->v[i].v.n);
+        else if (ops->v[i].t != T_DEL) b_lp(o, ops->v[i].v.p, ops->v[i].v.n);
     }
 }
 static void apply_mem(ops_t *ops, uint64_t seq) {
@@ -823,10 +930,11 @@ static void apply_mem(ops_t *ops, uint64_t seq) {
 static void db_write(ops_t *ops, int sync) {
     if (!ops->n) return;
     uint64_t seq = db.last_seq + 1;
-    buf_t p = {0}; b_fixed64(&p, seq); b_fixed32(&p, (uint32_t)ops->n); encode_ops(&p, ops);
+    ops_t w = to_wire(ops);
+    buf_t p = {0}; put_header(&p, db.next_lsn++, seq, (uint32_t)w.n); encode_ops(&p, &w);
     append(&p, sync); b_free(&p);
-    apply_mem(ops, seq);
-    db.last_seq = seq + ops->n - 1;
+    apply_mem(&w, seq);
+    db.last_seq = seq + w.n - 1;
     maybe_flush();
 }
 static int find_prep(const buf_t *xid) {
@@ -835,11 +943,11 @@ static int find_prep(const buf_t *xid) {
 }
 static void db_prepare(buf_t *xid, ops_t *ops, int sync) {
     if (find_prep(xid) >= 0 || !ops->n) die("bad prepare");
-    buf_t p = {0}; b_fixed64(&p, 0); b_fixed32(&p, 0); b_byte(&p, 0x10); encode_ops(&p, ops); b_byte(&p, 0x11); b_lp(&p, xid->p, xid->n);
-    append(&p, sync); b_free(&p);
+    ops_t w = to_wire(ops);
+    buf_t p = {0}; put_header(&p, db.next_lsn++, 0, 0); b_byte(&p, 0x10); encode_ops(&p, &w); b_byte(&p, 0x11); b_lp(&p, xid->p, xid->n);
+    size_t s = append(&p, sync); b_free(&p);
     db.prep = xrealloc(db.prep, sizeof(prep_t) * (db.nprep + 1));
-    db.prep[db.nprep].xid = b_copy(xid->p, xid->n); db.prep[db.nprep].ops = *ops; db.prep[db.nprep].log_no = db.log_no; db.nprep++;
-    memset(ops, 0, sizeof *ops);
+    db.prep[db.nprep].xid = b_copy(xid->p, xid->n); db.prep[db.nprep].ops = w; db.prep[db.nprep].log_no = db.log_nos[s]; db.nprep++;
     maybe_flush();
 }
 static void db_resolve(buf_t *xid, int commit, int sync) {
@@ -851,12 +959,12 @@ static void db_resolve(buf_t *xid, int commit, int sync) {
     buf_t p = {0};
     if (commit) {
         uint64_t seq = db.last_seq + 1;
-        b_fixed64(&p, seq); b_fixed32(&p, (uint32_t)pr.ops.n); b_byte(&p, 0x12); b_lp(&p, xid->p, xid->n);
+        put_header(&p, db.next_lsn++, seq, (uint32_t)pr.ops.n); b_byte(&p, 0x12); b_lp(&p, xid->p, xid->n);
         append(&p, sync);
         apply_mem(&pr.ops, seq);
         db.last_seq = seq + pr.ops.n - 1;
     } else {
-        b_fixed64(&p, 0); b_fixed32(&p, 0); b_byte(&p, 0x13); b_lp(&p, xid->p, xid->n);
+        put_header(&p, db.next_lsn++, 0, 0); b_byte(&p, 0x13); b_lp(&p, xid->p, xid->n);
         append(&p, sync);
     }
     b_free(&p);
@@ -864,14 +972,18 @@ static void db_resolve(buf_t *xid, int commit, int sync) {
 }
 
 /* ---- open */
+static void reset_runtime(void) {
+    db.next_lsn = 1; db.flushed_lsn = 0; db.blob_fd = -1; db.nblob = 0;
+}
 static void create_new(void) {
     names_t ns = f_listdir();
     for (int i = 0; i < ns.n; i++) { uint64_t num; if (parse_name(ns.v[i], &num) || !strcmp(ns.v[i], "CURRENT.dbtmp")) f_remove(ns.v[i]); }
     names_free(&ns);
+    reset_runtime();
     db.next_file = 1;
     uint64_t m = new_file_number();
-    new_log();
-    db.log_number = db.min_keep = db.log_no;
+    new_log_set();
+    db.log_number = db.min_keep = db.log_nos[0];
     write_new_manifest(m);
 }
 
@@ -949,20 +1061,23 @@ static void open_existing(void) {
     uint64_t mx = 0;
     for (int i = 0; i < ns.n; i++) { uint64_t num; if (parse_name(ns.v[i], &num) && num > mx) mx = num; }
     names_free(&ns);
+    reset_runtime();
     db.next_file = mx + 1;
     db.last_seq = ls;
     qsort(state.v, state.n, sizeof(entry_t), key_cmp);
     rdels_t none = {0};
     db.levels[0].n = 0;
     db.levels[1] = write_tables(&state, &none, 1);
-    new_log();
-    db.log_number = db.min_keep = db.log_no;
+    new_log_set();
+    db.log_number = db.min_keep = db.log_nos[0];
     write_new_manifest(new_file_number());
     purge_obsolete();
 }
 
 static void db_close(void) {
-    f_sync(db.log_fd); close(db.log_fd);
+    sync_wal();
+    for (size_t i = 0; i < opt.stripes; i++) close(db.log_fds[i]);
+    if (db.blob_fd >= 0) close(db.blob_fd);
     if (db.have_manifest) close(db.manifest_fd);
 }
 
@@ -977,12 +1092,16 @@ static const char *USAGE =
 "\n"
 "  put KEY VALUE [sync]\n"
 "  del KEY [sync]\n"
+"  merge KEY DELTA [sync]             adds the signed 64-bit integer DELTA\n"
+"                                     to the key's value (an 8-byte\n"
+"                                     little-endian integer; anything else\n"
+"                                     counts as 0)\n"
 "  delrange BEGIN END [sync]          removes keys k with BEGIN <= k < END\n"
 "  batch [sync]                       starts an atomic batch; following\n"
-"                                     put/del/delrange lines (without sync)\n"
+"                                     put/del/merge/delrange lines (without sync)\n"
 "                                     up to 'end' are written as one batch\n"
 "  prepare XID [nosync]               two-phase commit, phase 1: following\n"
-"                                     put/del/delrange lines up to 'end'\n"
+"                                     put/del/merge/delrange lines up to 'end'\n"
 "  commit XID [sync]                  two-phase commit, phase 2\n"
 "  rollback XID [sync]\n"
 "  close                              clean shutdown, then exit\n"
@@ -996,7 +1115,9 @@ static const char *USAGE =
 "\n"
 "Options (defaults): write_buffer_size=8192 l0_compaction_trigger=3\n"
 "  recycle_log_file_num=2 max_manifest_file_size=16384\n"
-"  target_file_size=16384 purge_obsolete_every=4 compression=1\n";
+"  target_file_size=16384 purge_obsolete_every=4 compression=1\n"
+"  wal_stripes=2 log_rotate_every=2 blob_threshold=1024\n"
+"  blob_file_size=65536\n";
 
 static int parse_op(char **tok, int nt, op_t *op) {
     memset(op, 0, sizeof *op);
@@ -1004,6 +1125,14 @@ static int parse_op(char **tok, int nt, op_t *op) {
 #define HEX(s, out) ((!strcmp((s), "-")) ? 0 : hex_decode((s), strlen(s), (out)))
     if (!strcmp(tok[0], "put") && nt >= 3) { op->t = T_VAL; return HEX(tok[1], &op->k) || HEX(tok[2], &op->v); }
     if (!strcmp(tok[0], "del")) { op->t = T_DEL; return HEX(tok[1], &op->k); }
+    if (!strcmp(tok[0], "merge") && nt >= 3) {
+        op->t = T_MERGE;
+        char *end; errno = 0;
+        long long d = strtoll(tok[2], &end, 10);
+        if (*end || errno) return -1;
+        b_fixed64(&op->v, (uint64_t)d);
+        return HEX(tok[1], &op->k);
+    }
     if (!strcmp(tok[0], "delrange") && nt >= 3) {
         op->t = T_RDEL;
         if (HEX(tok[1], &op->k) || HEX(tok[2], &op->v)) return -1;
@@ -1029,9 +1158,15 @@ int main(int argc, char **argv) {
             else if (!strcmp(kv, "target_file_size")) opt.target_file_size = strtoull(v, NULL, 10);
             else if (!strcmp(kv, "purge_obsolete_every")) opt.purge_every = strtoull(v, NULL, 10);
             else if (!strcmp(kv, "compression")) opt.compression = atoi(v);
+            else if (!strcmp(kv, "wal_stripes")) opt.stripes = strtoull(v, NULL, 10);
+            else if (!strcmp(kv, "log_rotate_every")) opt.rotate_every = strtoull(v, NULL, 10);
+            else if (!strcmp(kv, "blob_threshold")) opt.blob_threshold = strtoull(v, NULL, 10);
+            else if (!strcmp(kv, "blob_file_size")) opt.blob_file_size = strtoull(v, NULL, 10);
             else if (!strcmp(kv, "recover")) opt.recover_cmd = v;
             else die("unknown option %s", kv);
             if (opt.purge_every == 0) die("purge_obsolete_every must be > 0");
+            if (opt.stripes == 0 || opt.stripes > MAX_STRIPES) die("wal_stripes must be 1..16");
+            if (opt.rotate_every == 0) die("log_rotate_every must be > 0");
             continue;
         }
         break;

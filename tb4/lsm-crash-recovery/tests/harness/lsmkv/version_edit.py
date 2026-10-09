@@ -17,6 +17,8 @@ Encoding: a sequence of (varint tag, value) fields:
                         varstring largest internal key
     7  MIN_LOG_TO_KEEP  varint   WAL files numbered < this are not needed
                                  at all (see db.py: _flush)
+    8  FLUSHED_LSN      varint   WAL records with lsn <= this are reflected
+                                 in tables
 """
 
 from .coding import put_length_prefixed, put_varint
@@ -28,6 +30,7 @@ TAG_LAST_SEQUENCE = 4
 TAG_DELETED_FILE = 5
 TAG_NEW_FILE = 6
 TAG_MIN_LOG_TO_KEEP = 7
+TAG_FLUSHED_LSN = 8
 
 COMPARATOR_NAME = b"lsmkv.BytewiseComparator"
 
@@ -47,6 +50,7 @@ class VersionEdit:
         self.next_file_number = None
         self.last_sequence = None
         self.min_log_to_keep = None
+        self.flushed_lsn = None
         self.deleted_files = []  # (level, number)
         self.new_files = []      # (level, FileMeta)
 
@@ -62,6 +66,8 @@ class VersionEdit:
             out += put_varint(TAG_LAST_SEQUENCE) + put_varint(self.last_sequence)
         if self.min_log_to_keep is not None:
             out += put_varint(TAG_MIN_LOG_TO_KEEP) + put_varint(self.min_log_to_keep)
+        if self.flushed_lsn is not None:
+            out += put_varint(TAG_FLUSHED_LSN) + put_varint(self.flushed_lsn)
         for level, number in self.deleted_files:
             out += put_varint(TAG_DELETED_FILE) + put_varint(level) + put_varint(number)
         for level, f in self.new_files:

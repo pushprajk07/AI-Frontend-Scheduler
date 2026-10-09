@@ -4,6 +4,8 @@ import struct
 
 TYPE_DELETION = 0x00
 TYPE_VALUE = 0x01
+TYPE_BLOB = 0x02        # value is a blob pointer (see write_batch.py)
+TYPE_MERGE = 0x03       # value is a signed 64-bit little-endian delta
 TYPE_RANGE_DELETION = 0x0F
 
 MAX_SEQUENCE = (1 << 56) - 1
@@ -21,6 +23,20 @@ def unpack_internal_key(ikey: bytes):
     return bytes(ikey[:-8]), tag >> 8, tag & 0xFF
 
 
+def merge_base(value):
+    """Integer interpretation of a value for MERGE: an 8-byte value is a
+    signed little-endian int64, anything else counts as 0."""
+    if value is not None and len(value) == 8:
+        return struct.unpack("<q", value)[0]
+    return 0
+
+
+def merge_apply(value, delta_bytes):
+    r = merge_base(value) + struct.unpack("<q", delta_bytes)[0]
+    r = (r + (1 << 63)) % (1 << 64) - (1 << 63)  # wraps like int64
+    return struct.pack("<q", r)
+
+
 def internal_key_sort_key(ikey: bytes):
     """Order: user key ascending, then sequence descending, then type
     descending."""
@@ -30,6 +46,10 @@ def internal_key_sort_key(ikey: bytes):
 
 def log_file_name(n: int) -> str:
     return "%06d.log" % n
+
+
+def blob_file_name(n: int) -> str:
+    return "%06d.blob" % n
 
 
 def table_file_name(n: int) -> str:
@@ -53,7 +73,7 @@ def parse_file_name(name: str):
         if rest.isdigit():
             return ("manifest", int(rest))
         return None
-    for suffix, kind in ((".log", "log"), (".sst", "table")):
+    for suffix, kind in ((".log", "log"), (".sst", "table"), (".blob", "blob")):
         if name.endswith(suffix):
             stem = name[: -len(suffix)]
             if stem.isdigit():

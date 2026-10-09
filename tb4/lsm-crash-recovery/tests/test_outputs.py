@@ -123,6 +123,18 @@ def test_two_phase_commit():
     check_family("two_phase_commit")
 
 
+def test_striped_wal_power_loss():
+    check_family("striped_wal_power_loss")
+
+
+def test_checkpoint_flushes():
+    check_family("checkpoint_flushes")
+
+
+def test_value_separation():
+    check_family("value_separation")
+
+
 def test_output_contract_and_read_only():
     """Exact output format, no modification of the database directory,
     and an uninitialised directory (no CURRENT) recovers as empty."""

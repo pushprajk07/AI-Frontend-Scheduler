@@ -153,8 +153,8 @@ def sl(b, p):
 
 
 def parse(rec):
-    seq, cnt = struct.unpack_from("<QI", rec)
-    p, ops, xid, kind = 12, [], None, "plain"
+    lsn, seq, cnt = struct.unpack_from("<QQI", rec)
+    p, ops, xid, kind = 20, [], None, "plain"
     while p < len(rec):
         t = rec[p]
         p += 1
@@ -165,11 +165,18 @@ def parse(rec):
             kind = {0x11: "prepare", 0x12: "commit", 0x13: "rollback"}[t]
         else:
             k, p = sl(rec, p)
-            v = b""
-            if t != 0:
+            if t == 2:
+                q = p
+                for _ in range(3):
+                    _, p = uv(rec, p)
+                p += 4
+                v = rec[q:p]
+            elif t == 0:
+                v = b""
+            else:
                 v, p = sl(rec, p)
             ops.append((t, k, v))
-    return kind, seq, cnt, ops, xid
+    return lsn, kind, seq, cnt, ops, xid
 
 
 def main(d):
@@ -179,6 +186,7 @@ def main(d):
     rd = lambda n: open(os.path.join(d, n), "rb").read()  # noqa: E731
     man = rd("CURRENT").decode().rstrip("\n")
     lognum = keep = None
+    flushed = 0
     lastseq = 0
     live = set()
     for rec in records(rd(man), None):
@@ -187,7 +195,7 @@ def main(d):
             tag, p = uv(rec, p)
             if tag == 1:
                 _, p = sl(rec, p)
-            elif tag in (2, 3, 4, 7):
+            elif tag in (2, 3, 4, 7, 8):
                 v, p = uv(rec, p)
                 if tag == 2:
                     lognum = v
@@ -195,6 +203,8 @@ def main(d):
                     lastseq = v
                 elif tag == 7:
                     keep = v
+                elif tag == 8:
+                    flushed = v
             elif tag == 5:
                 _, p = uv(rec, p)
                 n, p = uv(rec, p)
@@ -208,35 +218,77 @@ def main(d):
                 live.add(n)
     keep = lognum if keep is None else min(keep, lognum)
 
+    blobcache = {}
+
+    def blob(ptr):
+        q = 0
+        f, q = uv(ptr, q)
+        off, q = uv(ptr, q)
+        ln, q = uv(ptr, q)
+        crc = struct.unpack_from("<I", ptr, q)[0]
+        nm = "%06d.blob" % f
+        if nm not in names:
+            return None
+        if nm not in blobcache:
+            blobcache[nm] = rd(nm)
+        v = blobcache[nm][off:off + ln]
+        return v if len(v) == ln and unmask(crc) == crc32c(v) else None
+
+    def deblob(ops):
+        out = []
+        for t, k, v in ops:
+            if t == 2:
+                v = blob(v)
+                if v is None:
+                    return None
+                t = 1
+            out.append((t, k, v))
+        return out
+
     events = []  # (seq, order, op)
     for n in live:
         tr = TableReader(rd("%06d.sst" % n))
         for k, s, t, v in tr.entries():
+            if t == 2:
+                v, t = blob(v), 1
             events.append((s, 1, (t, k, v)))
         for b, e, s in tr.range_deletions():
             events.append((s, 0, (0x0F, b, e)))
-    wal_ops = []
-    prepared = {}
-    lognums = sorted(int(x.split(".")[0]) for x in names if x.endswith(".log"))
-    for ln in lognums:
+
+    by_lsn = {}
+    for ln in sorted(int(x.split(".")[0]) for x in names if x.endswith(".log")):
         if ln < keep:
             continue
         for rec in records(rd("%06d.log" % ln), ln):
-            kind, seq, cnt, ops, xid = parse(rec)
-            if kind == "prepare":
-                prepared[xid] = ops
-                continue
-            if kind == "rollback":
-                prepared.pop(xid, None)
-                continue
-            if kind == "commit":
-                ops = prepared.pop(xid, [])
-            if ln >= lognum and cnt:
-                wal_ops += [(seq + i, op) for i, op in enumerate(ops)]
+            r = parse(rec)
+            by_lsn[r[0]] = r
+    prepared = {}
+    for lsn in sorted(x for x in by_lsn if x <= flushed):
+        _, kind, seq, cnt, ops, xid = by_lsn[lsn]
+        if kind == "prepare":
+            prepared[xid] = deblob(ops)
+        elif kind != "plain":
+            prepared.pop(xid, None)
+    wal_ops = []
+    lsn = flushed + 1
+    while lsn in by_lsn:
+        _, kind, seq, cnt, ops, xid = by_lsn[lsn]
+        if kind == "prepare":
+            o = deblob(ops)
+            if o is None:
+                break
+            prepared[xid] = o
+        elif kind == "rollback":
+            prepared.pop(xid, None)
+        else:
+            o = prepared.pop(xid) if kind == "commit" else deblob(ops)
+            if o is None:
+                break
+            wal_ops += [(seq + i, op) for i, op in enumerate(o)]
+            if cnt:
                 lastseq = max(lastseq, seq + cnt - 1)
-    # Table entries: for a key, versions within the tables are replayed
-    # oldest first; seq ties (all zeros in the bottom level) do not occur
-    # for the same key.  Range deletions sort before puts of equal seq.
+        lsn += 1
+
     events.sort(key=lambda e: (e[0], e[1]))
     state = {}
 
@@ -246,6 +298,10 @@ def main(d):
             state[k] = v
         elif t == 0:
             state.pop(k, None)
+        elif t == 3:
+            cur = state.get(k)
+            base = struct.unpack("<q", cur)[0] if cur is not None and len(cur) == 8 else 0
+            state[k] = struct.pack("<Q", (base + struct.unpack("<q", v)[0]) & 0xFFFFFFFFFFFFFFFF)
         else:
             for kk in [kk for kk in state if k <= kk < v]:
                 del state[kk]

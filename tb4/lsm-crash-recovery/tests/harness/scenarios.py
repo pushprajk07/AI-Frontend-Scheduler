@@ -22,6 +22,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 from lsmkv import DB, Options, WriteBatch  # noqa: E402  (harness-private copy)
+from lsmkv.dbformat import merge_apply  # noqa: E402
 from lsmkv.log_format import BLOCK_SIZE, RECYCLABLE_HEADER_SIZE  # noqa: E402
 from simfs import Crash, SimFS  # noqa: E402
 import refrecover  # noqa: E402
@@ -55,16 +56,16 @@ class Recorder:
         self.records = []   # every WAL record, in write order
         self.txns = 0       # number of user-level writes issued (for triggers)
 
-    def on_wal_record(self, fh, start, end, payload, event):
+    def on_wal_record(self, fh, start, end, payload, event, blobs=()):
         f = fh.f
         ranges = fragment_ranges(start, len(payload))
         assert ranges[-1][1] == end, (ranges, end)
-        self.records.append({
-            "file": f,
-            "ranges": [(a, b, bytes(f.cur[a:b])) for a, b in ranges],
-            "ev": self.fs.events,
-            "event": event,
-        })
+        parts = [(f, a, b, bytes(f.cur[a:b])) for a, b in ranges]
+        # a record whose values live in a blob file is only complete if
+        # those blob bytes are on disk too
+        for bfh, off, ln in blobs:
+            parts.append((bfh.f, off, off + ln, bytes(bfh.f.cur[off:off + ln])))
+        self.records.append({"parts": parts, "ev": self.fs.events, "event": event})
         self.txns += 1
 
 
@@ -72,6 +73,8 @@ def apply_ops(model, ops):
     for t, k, v in ops:
         if t == 1:
             model[k] = v
+        elif t == 3:
+            model[k] = merge_apply(model.get(k), v)
         elif t == 0:
             model.pop(k, None)
         else:
@@ -80,16 +83,16 @@ def apply_ops(model, ops):
 
 
 def survived(txn, image):
-    # A record is on disk if a sync of its file happened after it was
-    # written, or if every byte of its fragments made it anyway.
-    f = txn["file"]
-    if f.last_sync_event > txn["ev"]:
-        return True
-    assert f.alive, "unsynced WAL data in a dead file"
-    img = image.get(f.name)
-    if img is None:
-        return False
-    return all(img[a:b] == data for a, b, data in txn["ranges"])
+    # A record is on disk if each of its byte ranges (WAL fragments, blob
+    # values) was covered by a later sync of its file, or made it anyway.
+    for f, a, b, data in txn["parts"]:
+        if f.last_sync_event > txn["ev"]:
+            continue
+        assert f.alive, "unsynced data in a dead file"
+        img = image.get(f.name)
+        if img is None or img[a:b] != data:
+            return False
+    return True
 
 
 class Trigger:
@@ -192,6 +195,8 @@ class Workload:
                 b.delete_range(a, z)
             elif x < c.get("range_p", 0.05) + c.get("del_p", 0.15):
                 b.delete(r.choice(self.keys))
+            elif x < c.get("range_p", 0.05) + c.get("del_p", 0.15) + c.get("merge_p", 0.0):
+                b.merge(r.choice(self.keys[: max(4, len(self.keys) // 6)]), r.randint(-1000, 1 << 40))
             else:
                 b.put(r.choice(self.keys), self.value())
         if nops == 1 and r.random() < c.get("boundary_p", 0.0):
@@ -205,15 +210,16 @@ class Workload:
         t, k, _ = b.ops[0]
         if t != 1:
             return
-        bo = db.logw.block_offset
+        # the next record (lsn = db.next_lsn) goes to this stripe
+        bo = db.logws[db.next_lsn % db.opts.wal_stripes].block_offset
         if BLOCK_SIZE - bo < HS:
             bo = 0
         x = self.rng.randint(0, 12)
         room = BLOCK_SIZE - bo - HS - x
-        fixed = 12 + 1 + 1 + len(k)
+        fixed = 20 + 1 + 1 + len(k)
         for vl_bytes in (1, 2, 3):
             vlen = room - fixed - vl_bytes
-            if vlen >= 0 and len(_varint(vlen)) == vl_bytes:
+            if 0 <= vlen < db.opts.blob_threshold and len(_varint(vlen)) == vl_bytes:
                 b.ops[0] = (1, k, bytes([0x61 + (i % 7) for i in range(vlen)]))
                 return
 
