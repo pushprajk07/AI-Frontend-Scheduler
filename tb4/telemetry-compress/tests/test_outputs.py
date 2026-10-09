@@ -23,9 +23,9 @@ DECOMPRESS = "/app/decompress"
 TIME_LIMIT = 60.0
 SCORING_SEEDS = [7301, 7302, 7303]
 NREQ = 4000
-TARGET = 30.0          # aggregate ratio over the scoring logs
-TARGET_EACH = 29.0     # every individual scoring log
-STRUCT_TARGET = 22.0   # aggregate ratio required on lightly corrupted logs
+TARGET = 33.0          # aggregate ratio over the scoring logs
+TARGET_EACH = 32.0     # every individual scoring log
+STRUCT_TARGET = 25.0   # aggregate ratio required on lightly corrupted logs
 
 _cache = {}
 
